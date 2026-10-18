@@ -1,0 +1,395 @@
+#!/bin/sh
+#
+# Containux — master init (PID 1)
+#
+# The host boots silently from an initramfs (kernel: "quiet loglevel=0
+# console=tty3"), immediately takes over tty1, and exists for one purpose:
+# detect the guest-partition state, run the first-boot TUI if the machine
+# is empty, then launch a single QEMU/KVM guest configured from
+# containux.conf. When the guest powers off, so does the physical machine.
+#
+# See GUIDE.md §1 (boot), §2 (state detection & TUI), §3 (QEMU mapping),
+# §5 (pitfall mitigations: evdev input trap, OOM protection, deterministic
+# hardware identity).
+#
+
+export PATH="/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin"
+export TERM="linux"
+
+BOOT_PART="/dev/nvme0n1p1"       # 100MB FAT32: kernel, initramfs, containux.conf
+GUEST_PART="/dev/nvme0n1p2"      # raw partition handed to the guest
+BOOT_MNT="/boot"
+QMP_SOCK="/tmp/qmp.sock"
+HOST_RESERVE_MB=256              # strict host cap: kernel + udev + QEMU overhead
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Print the first evdev node whose /proc/bus/input/devices block matches the
+# given pattern (e.g. "kbd", "mouse"). Used to locate the physical keyboard
+# and mouse for the install-time evdev → PS/2 relay (GUIDE.md §5.1).
+input_ev() {
+    awk -v pat="$1" '
+        /^H: Handlers/ { h = $0 }
+        /^$/ { if (h ~ pat && h ~ /event[0-9]/) { print h; exit } h = "" }
+    ' /proc/bus/input/devices 2>/dev/null | grep -o 'event[0-9]*' | head -n 1
+}
+
+# Record the sysfs busnum/devnum of the USB stick behind /dev/sda so the
+# udev→QMP pipeline can skip it (it is mapped as a guest block device).
+record_install_stick() {
+    SDIR=$(readlink -f /sys/block/sda 2>/dev/null)
+    [ -n "${SDIR}" ] || return 1
+    UDEV_DIR=$(dirname "${SDIR%/block/sda}")
+    [ -f "${UDEV_DIR}/busnum" ] || return 1
+    echo "$(cat "${UDEV_DIR}/busnum") $(cat "${UDEV_DIR}/devnum")" \
+        > /tmp/containux-install-stick
+}
+
+# /dev/sda present and physically on the USB bus?
+usb_stick_present() {
+    [ -b /dev/sda ] || return 1
+    case "$(readlink -f /sys/block/sda 2>/dev/null)" in
+        */usb*) return 0 ;;
+    esac
+    return 1
+}
+
+# Launch QEMU with the global ${QEMU_ARGS}. Returns 0 once the QMP socket is
+# up (i.e. the machine model was built successfully); kills and fails the
+# process otherwise so the caller can fall back.
+start_qemu() {
+    rm -f "${QMP_SOCK}"
+    qemu-system-x86_64 ${QEMU_ARGS} &
+    QEMU_PID=$!
+    i=0
+    while [ ${i} -lt 100 ]; do
+        [ -S "${QMP_SOCK}" ] && return 0
+        kill -0 "${QEMU_PID}" 2>/dev/null || break
+        sleep 0.1
+        i=$((i + 1))
+    done
+    kill "${QEMU_PID}" 2>/dev/null
+    wait "${QEMU_PID}" 2>/dev/null
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Stage 1 — early userspace (GUIDE.md §1: silent boot, host owns tty1)
+# ---------------------------------------------------------------------------
+
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm /proc /sys /tmp /run /run/udev "${BOOT_MNT}"
+mount -t proc   proc   /proc
+mount -t sysfs  sysfs  /sys
+mount -t tmpfs  tmpfs  /run
+mount -t devpts devpts /dev/pts
+mount -t tmpfs  tmpfs  /dev/shm
+
+clear 2>/dev/null
+
+# Take tty1 as our stdio for the TUI; the kernel console is on tty3.
+if [ -c /dev/tty1 ]; then
+    exec 0</dev/tty1 1>/dev/tty1 2>&1
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 2 — hardware discovery (eudev) and OOM protection (GUIDE.md §5.2)
+# ---------------------------------------------------------------------------
+
+# All device drivers except HID are built into the kernel, so a plain
+# trigger is enough — no early coldplug module dance required.
+udevd --daemon 2>/dev/null
+udevadm trigger --action=add 2>/dev/null
+udevadm settle --timeout=10 2>/dev/null
+
+# Guest RAM is locked by preallocation; the host must never OOM-kill QEMU.
+sysctl -w vm.overcommit_memory=2 >/dev/null 2>&1
+
+# ---------------------------------------------------------------------------
+# Stage 3 — state detection (GUIDE.md §2.1)
+# ---------------------------------------------------------------------------
+
+# Guest memory: everything except the hard 256MB host reserve.
+TOTAL_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+GUEST_MB=$(( TOTAL_KB / 1024 - HOST_RESERVE_MB ))
+[ "${GUEST_MB}" -lt 128 ] && GUEST_MB=128
+
+# blkid against the guest partition decides Installed vs Empty.
+INSTALLED=0
+if blkid "${GUEST_PART}" >/dev/null 2>&1; then
+    INSTALLED=1
+fi
+
+# Installation media present at boot? (GUIDE.md §3.1)
+CDROM=0
+USBMEDIA=0
+[ -b /dev/sr0 ] && CDROM=1
+usb_stick_present && USBMEDIA=1
+MEDIA=0
+[ "${CDROM}" = 1 ] || [ "${USBMEDIA}" = 1 ] && MEDIA=1
+
+# Input-trap mitigation (GUIDE.md §5.1): while the system is unconfigured or
+# booting from install media, the guest cannot trust its own USB stack yet —
+# HID stays on the host and is relayed to QEMU's emulated PS/2 ports through
+# evdev instead of blind USB passthrough.
+INSTALL_MODE=0
+if [ "${MEDIA}" = 1 ] || [ "${INSTALLED}" = 0 ]; then
+    INSTALL_MODE=1
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 4 — load or create containux.conf (GUIDE.md §2.2)
+# ---------------------------------------------------------------------------
+
+mount -t vfat -o ro "${BOOT_PART}" "${BOOT_MNT}" 2>/dev/null
+
+if [ "${INSTALLED}" = 0 ]; then
+    # Empty machine: hand tty1 to the first-boot TUI. It persists
+    # containux.conf to the boot partition itself and drops /tmp/tui.done
+    # when finished. setsid+cttyhack give dialog a controlling terminal.
+    umount "${BOOT_MNT}" 2>/dev/null
+    rm -f /tmp/tui.done /tmp/tui.pid
+    setsid cttyhack /usr/local/bin/containux-tui.sh </dev/tty1 >/dev/tty1 2>&1
+    n=0
+    while [ ! -f /tmp/tui.done ]; do
+        n=$((n + 1))
+        if [ -f /tmp/tui.pid ]; then
+            # TUI process died abnormally before finishing — carry on with
+            # defaults rather than hang the machine forever.
+            kill -0 "$(cat /tmp/tui.pid)" 2>/dev/null || break
+        elif [ ${n} -gt 30 ]; then
+            break
+        fi
+        sleep 1
+    done
+    rm -f /tmp/tui.done /tmp/tui.pid
+    clear 2>/dev/null
+    mount -t vfat -o ro "${BOOT_PART}" "${BOOT_MNT}" 2>/dev/null
+fi
+
+if [ -f /tmp/containux.conf ]; then
+    . /tmp/containux.conf
+elif [ -f "${BOOT_MNT}/containux.conf" ]; then
+    . "${BOOT_MNT}/containux.conf"
+fi
+umount "${BOOT_MNT}" 2>/dev/null
+
+: "${TARGET_OS:=xp}"
+: "${GRAPHICS:=qxl}"
+: "${AUDIO:=ac97}"
+
+# Deterministic hardware identity (GUIDE.md §5.3). containux.conf normally
+# carries the MAC/SMBIOS UUID generated on first boot; regenerate from the
+# motherboard only if the file was somehow lost.
+if [ -z "${MAC}" ] || [ -z "${UUID}" ]; then
+    H=$(md5sum /sys/class/dmi/id/product_uuid 2>/dev/null | cut -d' ' -f1)
+    [ -n "${H}" ] || H=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-')
+    MAC="52:54:00:$(printf '%s' "${H}" | cut -c1-2):$(printf '%s' "${H}" | cut -c3-4):$(printf '%s' "${H}" | cut -c5-6)"
+    UUID="$(printf '%s' "${H}" | cut -c1-8)-$(printf '%s' "${H}" | cut -c9-12)-$(printf '%s' "${H}" | cut -c13-16)-$(printf '%s' "${H}" | cut -c17-20)-$(printf '%s' "${H}" | cut -c21-32)"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 5 — install-mode input plumbing (GUIDE.md §5.1)
+# ---------------------------------------------------------------------------
+
+KBD_EVENT=""
+MOUSE_EVENT=""
+if [ "${INSTALL_MODE}" = 1 ]; then
+    # Lift the usbhid blacklist for this session only: the host needs to read
+    # the primary keyboard/mouse and relay them to the emulated PS/2 ports.
+    # Once the OS is installed, the blacklist stays in force and every USB
+    # device is passed blind to the guest instead.
+    rm -f /etc/modprobe.d/containux.conf
+    modprobe hid 2>/dev/null
+    modprobe hid-generic 2>/dev/null
+    modprobe usbhid 2>/dev/null
+    sleep 1
+
+    KBD_EVENT=$(input_ev 'kbd')
+    [ -n "${KBD_EVENT}" ] || KBD_EVENT=$(input_ev 'eyboard')
+    MOUSE_EVENT=$(input_ev 'mouse')
+    [ -n "${MOUSE_EVENT}" ] || MOUSE_EVENT=$(input_ev 'ouse')
+
+    # Flags consumed by usb-hotplug.sh for the whole session.
+    touch /tmp/containux-install-mode
+    [ "${USBMEDIA}" = 1 ] && record_install_stick
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 6 — transparent network bridge (GUIDE.md §3.2)
+# ---------------------------------------------------------------------------
+
+PRIMARY_NIC=$(ls /sys/class/net 2>/dev/null | grep -v -e '^lo$' -e '^macvtap' | head -n 1)
+[ -n "${PRIMARY_NIC}" ] || PRIMARY_NIC="eth0"
+
+ip link add link "${PRIMARY_NIC}" name macvtap0 type macvtap mode bridge 2>/dev/null
+ip link set macvtap0 up 2>/dev/null
+
+# Open the macvtap character device as fd 3 and let QEMU inherit it
+# (-netdev tap,fd=3). Node naming varies by kernel: /dev/tapN or /dev/macvtapN.
+TAP_IDX=$(cat /sys/class/net/macvtap0/ifindex 2>/dev/null)
+TAP_NODE="/dev/tap${TAP_IDX}"
+[ -c "${TAP_NODE}" ] || TAP_NODE="/dev/macvtap${TAP_IDX}"
+if [ ! -c "${TAP_NODE}" ]; then
+    TAP_NODE=$(ls /dev/macvtap* /dev/tap[0-9]* 2>/dev/null | head -n 1)
+fi
+
+NET_ARGS="-nic none"
+if [ -n "${TAP_NODE}" ] && [ -c "${TAP_NODE}" ]; then
+    exec 3<>"${TAP_NODE}"
+    NET_ARGS="-netdev tap,fd=3,id=hostnet0 -device e1000,netdev=hostnet0,mac=${MAC}"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 7 — virtual motherboard options (GUIDE.md §2.2, §3, §5.3)
+# ---------------------------------------------------------------------------
+
+# Graphics: default qxl (headless, served over local VNC), or bind the PCIe
+# GPU to vfio-pci and pass it through raw.
+VGA_ARGS="-vga qxl -vnc :0"
+if [ "${GRAPHICS}" = "vfio" ]; then
+    GPU_BDF=""
+    for d in /sys/bus/pci/devices/*; do
+        case "$(cat "${d}/class" 2>/dev/null)" in
+            0x0300*|0x0302*) GPU_BDF="${d##*/}"; break ;;
+        esac
+    done
+    if [ -n "${GPU_BDF}" ]; then
+        echo "vfio-pci" > "/sys/bus/pci/devices/${GPU_BDF}/driver_override" 2>/dev/null
+        echo "${GPU_BDF}" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null
+        VGA_ARGS="-vga none -device vfio-pci,host=${GPU_BDF}"
+    fi
+fi
+# Relative-pointer tablet helps VNC cursor tracking once the guest has HID
+# drivers; skipped during install (pre-driver installers only grok PS/2).
+if [ "${GRAPHICS}" = "qxl" ] && [ "${INSTALL_MODE}" = 0 ]; then
+    VGA_ARGS="${VGA_ARGS} -device usb-tablet"
+fi
+
+# Audio: AC97 for XP, Intel HDA for Vista/7 (GUIDE.md §2.2).
+AUDIO_ARGS="-device AC97"
+if [ "${AUDIO}" = "hda" ]; then
+    AUDIO_ARGS="-device intel-hda -device hda-duplex"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 8 — installation media (GUIDE.md §3.1)
+# ---------------------------------------------------------------------------
+
+if [ "${INSTALL_MODE}" = 1 ] && [ "${MEDIA}" = 0 ]; then
+    # First boot without media yet: wait on tty1 until the user inserts the
+    # installation CD/DVD or a bootable USB stick, then map it below.
+    echo "Containux: insert your operating system installation media now..."
+    while :; do
+        if [ -b /dev/sr0 ]; then
+            CDROM=1
+            break
+        fi
+        if usb_stick_present; then
+            USBMEDIA=1
+            break
+        fi
+        sleep 2
+    done
+    MEDIA=1
+    echo "Containux: booting the installation environment..."
+    sleep 2
+    [ "${USBMEDIA}" = 1 ] && record_install_stick
+fi
+
+# Boot from the installer CD before the (blank) guest disk.
+BOOT_ARGS=""
+if [ "${INSTALL_MODE}" = 1 ] && [ "${CDROM}" = 1 ]; then
+    BOOT_ARGS="-boot order=dc"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 9 — launch the guest (GUIDE.md §3)
+# ---------------------------------------------------------------------------
+
+SMP=$(grep -c '^processor' /proc/cpuinfo)
+[ "${SMP}" -lt 1 ] && SMP=1
+
+# KVM when the CPU/kernel offers it, TCG as a functional fallback.
+ACCEL_ARGS="-enable-kvm"
+if [ ! -e /dev/kvm ]; then
+    ACCEL_ARGS="-accel tcg"
+fi
+
+# Install-mode input: relay the physical keyboard/mouse through evdev onto
+# QEMU's emulated PS/2 ports (GUIDE.md §5.1).
+INPUT_ARGS=""
+if [ "${INSTALL_MODE}" = 1 ]; then
+    if [ -n "${KBD_EVENT}" ] && [ -e "/dev/input/${KBD_EVENT}" ]; then
+        INPUT_ARGS="${INPUT_ARGS} -object input-linux,id=kbd,evdev=/dev/input/${KBD_EVENT}"
+    fi
+    if [ -n "${MOUSE_EVENT}" ] && [ -e "/dev/input/${MOUSE_EVENT}" ]; then
+        INPUT_ARGS="${INPUT_ARGS} -object input-linux,id=mouse,evdev=/dev/input/${MOUSE_EVENT}"
+    fi
+fi
+
+build_qemu_args() {
+    QEMU_ARGS="
+        ${ACCEL_ARGS}
+        -machine pc
+        -uuid ${UUID}
+        -m ${GUEST_MB} -mem-prealloc
+        -smp ${SMP}
+        -rtc base=localtime
+        -global PIIX4_PM.disable_s3=1
+        -device usb-ehci,id=ehci
+        ${VGA_ARGS}
+        -display none
+        ${AUDIO_ARGS}
+        -drive file=${GUEST_PART},format=raw,if=ide,cache=none,${AIO_ARG}
+        ${DRIVE_EXTRA_ARGS}
+        ${INPUT_ARGS}
+        ${NET_ARGS}
+        -qmp unix:${QMP_SOCK},server,nowait
+        ${BOOT_ARGS}
+    "
+}
+
+# Storage (GUIDE.md §3.1): the raw guest partition rides legacy IDE for
+# period-accurate compatibility, with direct I/O so the host page cache
+# never duplicates the guest's work. Optical media and bootable USB install
+# media are mapped when present; the USB stick only during install mode
+# (otherwise it is passed to the guest blind like every other USB device).
+DRIVE_EXTRA_ARGS=""
+if [ "${CDROM}" = 1 ]; then
+    DRIVE_EXTRA_ARGS="${DRIVE_EXTRA_ARGS} -drive file=/dev/sr0,media=cdrom,if=ide"
+fi
+if [ "${INSTALL_MODE}" = 1 ] && [ "${USBMEDIA}" = 1 ]; then
+    DRIVE_EXTRA_ARGS="${DRIVE_EXTRA_ARGS} -drive file=/dev/sda,format=raw,if=none,id=usbdrive -device usb-storage,drive=usbdrive"
+fi
+
+# GUIDE.md §3.1 specifies aio=native; Buildroot's QEMU ships without
+# linux-aio, so try native first and silently fall back to threaded AIO.
+AIO_ARG="aio=native"
+build_qemu_args
+if ! start_qemu; then
+    AIO_ARG="aio=threads"
+    build_qemu_args
+    if ! start_qemu; then
+        # The machine model could not be built at all — nothing to show.
+        sleep 2
+        poweroff -f
+    fi
+fi
+
+# Devices that were already present at boot fired their udev "add" events
+# before QEMU existed. Replay them now that the QMP socket is up, so every
+# physical USB device appears in the guest immediately (GUIDE.md §4).
+udevadm trigger --action=add --subsystem-match=usb 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# Stage 10 — lifecycle (GUIDE.md §3.3)
+# ---------------------------------------------------------------------------
+# A guest reboot is handled internally by QEMU's virtual motherboard and
+# never reaches this point. Reaching here means the guest powered off:
+# power down the physical machine exactly like real hardware would.
+wait "${QEMU_PID}"
+sync
+poweroff -f

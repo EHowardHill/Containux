@@ -1,0 +1,10 @@
+# Containux — blind USB passthrough (GUIDE.md §4.2)
+#
+# Every USB device added to the physical machine is pushed into the guest's
+# emulated EHCI controller through the QMP socket the moment it appears;
+# every removal is pushed the moment it disappears. The host kernel never
+# claims these devices (see /etc/modprobe.d/containux.conf), so the guest
+# gets exclusive, uninhibited access to the hardware.
+
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", RUN+="/usr/local/bin/usb-hotplug.sh add %E{BUSNUM} %E{DEVNUM}"
+ACTION=="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", RUN+="/usr/local/bin/usb-hotplug.sh remove %E{BUSNUM} %E{DEVNUM}"

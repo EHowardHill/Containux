@@ -1,0 +1,65 @@
+# Containux — Buildroot master configuration (x86_64 appliance)
+#
+# The host boots entirely from an initramfs linked into the kernel image,
+# reserves 256 MB of RAM for itself, and gives every remaining megabyte to
+# a single QEMU/KVM guest (see GUIDE.md).
+
+# ---- Architecture & toolchain -------------------------------------------
+BR2_x86_64=y
+BR2_TOOLCHAIN_BUILDROOT_GLIBC=y
+BR2_KERNEL_HEADERS_AS_KERNEL=y
+BR2_INSTALL_LIBSTDCPP=y
+
+# ---- Init: none — the custom /init (rootfs overlay) is PID 1 --------------
+# No systemd/sysvinit, no getty, no boot text: the init script takes over
+# tty1 immediately and the kernel console lives on tty3 (GUIDE.md §1).
+BR2_INIT_NONE=y
+BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_EUDEV=y
+
+# ---- Kernel: minimal, silent, initramfs-only ------------------------------
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
+BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="board/containux/linux.config"
+
+# ---- BusyBox: minimal applet set ------------------------------------------
+BR2_PACKAGE_BUSYBOX=y
+BR2_PACKAGE_BUSYBOX_CONFIG="board/containux/busybox.config"
+# Allow util-linux blkid alongside busybox's applet
+BR2_PACKAGE_BUSYBOX_SHOW_OTHERS=y
+
+# ---- QEMU/KVM guest hypervisor --------------------------------------------
+BR2_PACKAGE_QEMU=y
+BR2_PACKAGE_QEMU_SYSTEM=y
+BR2_PACKAGE_QEMU_BLOBS=y
+# Build only the x86_64 system emulator we actually run
+BR2_PACKAGE_QEMU_CHOOSE_TARGETS=y
+BR2_PACKAGE_QEMU_TARGET_X86_64=y
+# -vga qxl requires spice support in QEMU
+BR2_PACKAGE_SPICE=y
+# Headless host: the qxl framebuffer is exposed over local VNC
+BR2_PACKAGE_LIBVNCSERVER=y
+# usb-host passthrough requires libusb
+BR2_PACKAGE_LIBUSB=y
+
+# ---- Hardware plumbing ------------------------------------------------------
+# eudev: fires usb-hotplug.sh on every USB add/remove event
+BR2_PACKAGE_EUDEV=y
+# socat: carries the udev JSON payloads to the QEMU Monitor Protocol socket
+BR2_PACKAGE_SOCAT=y
+# dialog: the first-boot Text User Interface (GUIDE.md §2)
+BR2_PACKAGE_DIALOG=y
+# blkid: guest-partition state detection (Installed vs Empty)
+BR2_PACKAGE_UTIL_LINUX=y
+BR2_PACKAGE_UTIL_LINUX_BLKID=y
+# iproute2: the real `ip` tool (busybox cannot create macvtap bridges)
+BR2_PACKAGE_IPROUTE2=y
+
+# ---- Root filesystem: initramfs only ---------------------------------------
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_CPIO_GZIP=y
+# Link the initramfs into the kernel → single unified bzImage
+BR2_TARGET_ROOTFS_INITRAMFS=y
+
+# ---- Board integration -------------------------------------------------------
+BR2_ROOTFS_OVERLAY="board/containux/rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="board/containux/post-build.sh"
