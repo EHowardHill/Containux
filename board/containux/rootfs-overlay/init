@@ -26,6 +26,33 @@ HOST_RESERVE_MB=256              # strict host cap: kernel + udev + QEMU overhea
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Progress markers go to the active kernel console. On real hardware that
+# is tty3 (out of sight, matching the invisible-boot requirement); when a
+# serial console is added to the kernel command line — as tests/run-test.sh
+# does with --serial — the markers turn into a full boot trace.
+trace() {
+    echo "Containux: $*" > /dev/console 2>/dev/null
+}
+
+# Probe whether KVM can be used. On real hardware this is trivial (CPU
+# flags do not lie), but in emulated test environments every static
+# signal is a lie: QEMU's default CPU reports a fake svm flag, kvm_amd
+# then loads on it, and even a probe VM keeps running on broken KVM.
+# The test harness therefore declares itself with containux.no-kvm on
+# the kernel command line; without it, the CPU flags are trusted.
+KVM_OK=""
+kvm_usable() {
+    if [ -z "${KVM_OK}" ]; then
+        KVM_OK=0
+        if ! tr ' ' '\n' < /proc/cmdline | grep -q '^containux\.no-kvm$'; then
+            if [ -e /dev/kvm ] && grep -q -w -e vmx -e svm /proc/cpuinfo; then
+                KVM_OK=1
+            fi
+        fi
+    fi
+    [ "${KVM_OK}" = 1 ]
+}
+
 # Print the first evdev node whose /proc/bus/input/devices block matches the
 # given pattern (e.g. "kbd", "mouse"). Used to locate the physical keyboard
 # and mouse for the install-time evdev → PS/2 relay (GUIDE.md §5.1).
@@ -47,6 +74,12 @@ record_install_stick() {
         > /tmp/containux-install-stick
 }
 
+# An empty optical drive still registers /dev/sr0; only a tray with media
+# that can actually be read counts as installation media.
+cdrom_has_media() {
+    dd if=/dev/sr0 bs=1 count=1 >/dev/null 2>&1
+}
+
 # /dev/sda present and physically on the USB bus?
 usb_stick_present() {
     [ -b /dev/sda ] || return 1
@@ -61,15 +94,24 @@ usb_stick_present() {
 # process otherwise so the caller can fall back.
 start_qemu() {
     rm -f "${QMP_SOCK}"
-    qemu-system-x86_64 ${QEMU_ARGS} &
+    # QEMU diagnostics go to the active kernel console: invisible on real
+    # hardware (console=tty3), but captured by the test harness when it
+    # appends console=ttyS0.
+    qemu-system-x86_64 ${QEMU_ARGS} 2>>/dev/console &
     QEMU_PID=$!
     i=0
     while [ ${i} -lt 100 ]; do
-        [ -S "${QMP_SOCK}" ] && return 0
+        [ -S "${QMP_SOCK}" ] && break
         kill -0 "${QEMU_PID}" 2>/dev/null || break
         sleep 0.1
         i=$((i + 1))
     done
+    # The QMP socket appears early in QEMU's startup; make sure the machine
+    # model is fully past initialization before declaring success.
+    if [ -S "${QMP_SOCK}" ]; then
+        sleep 2
+        kill -0 "${QEMU_PID}" 2>/dev/null && return 0
+    fi
     kill "${QEMU_PID}" 2>/dev/null
     wait "${QEMU_PID}" 2>/dev/null
     return 1
@@ -87,12 +129,14 @@ mount -t tmpfs  tmpfs  /run
 mount -t devpts devpts /dev/pts
 mount -t tmpfs  tmpfs  /dev/shm
 
-clear 2>/dev/null
-
 # Take tty1 as our stdio for the TUI; the kernel console is on tty3.
 if [ -c /dev/tty1 ]; then
     exec 0</dev/tty1 1>/dev/tty1 2>&1
 fi
+# Wipe SeaBIOS's output from the visible console. The escape sequence is
+# written straight to the device so the cleanup does not depend on where
+# this shell's stdio happens to point.
+printf '\033[H\033[2J\033[3J' > /dev/tty1 2>/dev/null
 
 # ---------------------------------------------------------------------------
 # Stage 2 — hardware discovery (eudev) and OOM protection (GUIDE.md §5.2)
@@ -105,27 +149,53 @@ udevadm trigger --action=add 2>/dev/null
 udevadm settle --timeout=10 2>/dev/null
 
 # Guest RAM is locked by preallocation; the host must never OOM-kill QEMU.
+# Strict overcommit (mode 2) is required for that, but its default
+# overcommit_ratio of 50% caps CommitLimit at half of RAM — less than the
+# guest itself asks for, so the inner QEMU allocation would always fail.
+# A ratio of 200 keeps the ceiling at 2x RAM: unbounded overcommit stays
+# impossible, while the preallocated guest plus QEMU's translation and
+# runtime overhead always fit.
 sysctl -w vm.overcommit_memory=2 >/dev/null 2>&1
+sysctl -w vm.overcommit_ratio=200 >/dev/null 2>&1
+# Report any process that receives a fatal signal (segfault etc.) on the
+# kernel console — the only way to see why a userspace tool died on a
+# silent, single-purpose appliance.
+sysctl -w kernel.print-fatal-signals=1 >/dev/null 2>&1
 
 # ---------------------------------------------------------------------------
 # Stage 3 — state detection (GUIDE.md §2.1)
 # ---------------------------------------------------------------------------
 
-# Guest memory: everything except the hard 256MB host reserve.
+# Guest memory: everything except the host reserve. With KVM the
+# hypervisor overhead is small and fixed, so the host keeps exactly
+# 256 MB (GUIDE.md §1) and the guest gets the rest. Without KVM, QEMU
+# falls back to TCG, whose translation buffers and device overhead add
+# up to roughly 70% on top of the guest's own memory — a flat or small
+# reserve lets the kernel OOM-kill the machine, so half of RAM is
+# reserved on the fallback path instead.
 TOTAL_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+if ! kvm_usable; then
+    TCG_RESERVE_MB=$(( TOTAL_KB / 1024 / 2 ))
+    [ "${TCG_RESERVE_MB}" -gt "${HOST_RESERVE_MB}" ] && HOST_RESERVE_MB="${TCG_RESERVE_MB}"
+    trace "no KVM: TCG fallback, reserving ${HOST_RESERVE_MB} MB for the host"
+fi
 GUEST_MB=$(( TOTAL_KB / 1024 - HOST_RESERVE_MB ))
 [ "${GUEST_MB}" -lt 128 ] && GUEST_MB=128
 
-# blkid against the guest partition decides Installed vs Empty.
+# blkid against the guest partition decides Installed vs Empty (GUIDE.md
+# §2.1). Careful: busybox blkid exits 0 even when no signature is found, so
+# the decision must be based on its output, not its status.
 INSTALLED=0
-if blkid "${GUEST_PART}" >/dev/null 2>&1; then
+if [ -n "$(blkid "${GUEST_PART}" 2>/dev/null)" ]; then
     INSTALLED=1
 fi
 
 # Installation media present at boot? (GUIDE.md §3.1)
 CDROM=0
 USBMEDIA=0
-[ -b /dev/sr0 ] && CDROM=1
+if [ -b /dev/sr0 ] && cdrom_has_media; then
+    CDROM=1
+fi
 usb_stick_present && USBMEDIA=1
 MEDIA=0
 [ "${CDROM}" = 1 ] || [ "${USBMEDIA}" = 1 ] && MEDIA=1
@@ -138,6 +208,7 @@ INSTALL_MODE=0
 if [ "${MEDIA}" = 1 ] || [ "${INSTALLED}" = 0 ]; then
     INSTALL_MODE=1
 fi
+trace "state: installed=${INSTALLED} cdrom=${CDROM} usb=${USBMEDIA} guest_mem_mb=${GUEST_MB} install_mode=${INSTALL_MODE}"
 
 # ---------------------------------------------------------------------------
 # Stage 4 — load or create containux.conf (GUIDE.md §2.2)
@@ -146,12 +217,15 @@ fi
 mount -t vfat -o ro "${BOOT_PART}" "${BOOT_MNT}" 2>/dev/null
 
 if [ "${INSTALLED}" = 0 ]; then
-    # Empty machine: hand tty1 to the first-boot TUI. It persists
-    # containux.conf to the boot partition itself and drops /tmp/tui.done
-    # when finished. setsid+cttyhack give dialog a controlling terminal.
+    # Empty machine: hand tty1 to the first-boot TUI. The inner shell must
+    # open tty1 itself as a session leader — that claims it as the
+    # controlling terminal (busybox's documented pattern). cttyhack would
+    # clobber stdio with the kernel's *active* console instead: the serial
+    # line during serial test runs, or the invisible tty3 in production.
+    trace "first boot: launching first-boot TUI on tty1"
     umount "${BOOT_MNT}" 2>/dev/null
     rm -f /tmp/tui.done /tmp/tui.pid
-    setsid cttyhack /usr/local/bin/containux-tui.sh </dev/tty1 >/dev/tty1 2>&1
+    setsid sh -c 'exec /usr/local/bin/containux-tui.sh </dev/tty1 >/dev/tty1 2>&1'
     n=0
     while [ ! -f /tmp/tui.done ]; do
         n=$((n + 1))
@@ -165,7 +239,10 @@ if [ "${INSTALLED}" = 0 ]; then
         sleep 1
     done
     rm -f /tmp/tui.done /tmp/tui.pid
-    clear 2>/dev/null
+    trace "tui finished: cleaning the visible console"
+    # Wipe the TUI's last screen off tty1. Written straight to the device
+    # so the cleanup never depends on this shell's stdio redirections.
+    printf '\033[H\033[2J\033[3J' > /dev/tty1 2>/dev/null
     mount -t vfat -o ro "${BOOT_PART}" "${BOOT_MNT}" 2>/dev/null
 fi
 
@@ -179,6 +256,7 @@ umount "${BOOT_MNT}" 2>/dev/null
 : "${TARGET_OS:=xp}"
 : "${GRAPHICS:=qxl}"
 : "${AUDIO:=ac97}"
+trace "conf: os=${TARGET_OS} graphics=${GRAPHICS} audio=${AUDIO} mac=${MAC:-<generated>} uuid=${UUID:+ok}"
 
 # Deterministic hardware identity (GUIDE.md §5.3). containux.conf normally
 # carries the MAC/SMBIOS UUID generated on first boot; regenerate from the
@@ -223,6 +301,17 @@ fi
 
 PRIMARY_NIC=$(ls /sys/class/net 2>/dev/null | grep -v -e '^lo$' -e '^macvtap' | head -n 1)
 [ -n "${PRIMARY_NIC}" ] || PRIMARY_NIC="eth0"
+ip link set "${PRIMARY_NIC}" up 2>/dev/null
+
+# Optional debug address for the host itself (kernel cmdline parameter
+# containux.debugnet=<ip>/<prefix>, set e.g. by tests/run-test.sh). The
+# appliance normally stays unaddressed — only the guest is bridged onto
+# the primary NIC — but with an address the inner guest's VNC server
+# becomes reachable through the uplink, which makes lab testing possible.
+DEBUGNET=$(tr ' ' '\n' < /proc/cmdline | sed -n 's/^containux\.debugnet=//p')
+if [ -n "${DEBUGNET}" ]; then
+    ip addr add "${DEBUGNET}" dev "${PRIMARY_NIC}" 2>/dev/null
+fi
 
 ip link add link "${PRIMARY_NIC}" name macvtap0 type macvtap mode bridge 2>/dev/null
 ip link set macvtap0 up 2>/dev/null
@@ -241,14 +330,16 @@ if [ -n "${TAP_NODE}" ] && [ -c "${TAP_NODE}" ]; then
     exec 3<>"${TAP_NODE}"
     NET_ARGS="-netdev tap,fd=3,id=hostnet0 -device e1000,netdev=hostnet0,mac=${MAC}"
 fi
+trace "net: nic=${PRIMARY_NIC} tap=${TAP_NODE:-none} debugnet=${DEBUGNET:-none}"
 
 # ---------------------------------------------------------------------------
 # Stage 7 — virtual motherboard options (GUIDE.md §2.2, §3, §5.3)
 # ---------------------------------------------------------------------------
 
-# Graphics: default qxl (headless, served over local VNC), or bind the PCIe
-# GPU to vfio-pci and pass it through raw.
-VGA_ARGS="-vga qxl -vnc :0"
+# Graphics: default qxl (headless, VNC served on all interfaces so the
+# containux.debugnet path — or a physical network — can reach it), or bind
+# the PCIe GPU to vfio-pci and pass it through raw.
+VGA_ARGS="-vga qxl -vnc 0.0.0.0:0"
 if [ "${GRAPHICS}" = "vfio" ]; then
     GPU_BDF=""
     for d in /sys/bus/pci/devices/*; do
@@ -283,7 +374,7 @@ if [ "${INSTALL_MODE}" = 1 ] && [ "${MEDIA}" = 0 ]; then
     # installation CD/DVD or a bootable USB stick, then map it below.
     echo "Containux: insert your operating system installation media now..."
     while :; do
-        if [ -b /dev/sr0 ]; then
+        if [ -b /dev/sr0 ] && cdrom_has_media; then
             CDROM=1
             break
         fi
@@ -312,10 +403,11 @@ fi
 SMP=$(grep -c '^processor' /proc/cpuinfo)
 [ "${SMP}" -lt 1 ] && SMP=1
 
-# KVM when the CPU/kernel offers it, TCG as a functional fallback.
-ACCEL_ARGS="-enable-kvm"
-if [ ! -e /dev/kvm ]; then
-    ACCEL_ARGS="-accel tcg"
+# KVM when the CPU/kernel actually supports it (probed above — the mere
+# presence of /dev/kvm is not proof), TCG as a functional fallback.
+ACCEL_ARGS="-accel tcg"
+if kvm_usable; then
+    ACCEL_ARGS="-enable-kvm"
 fi
 
 # Install-mode input: relay the physical keyboard/mouse through evdev onto
@@ -374,10 +466,13 @@ if ! start_qemu; then
     build_qemu_args
     if ! start_qemu; then
         # The machine model could not be built at all — nothing to show.
+        trace "guest machine failed to start; powering off"
+        echo "Containux: guest machine failed to start; powering off." > /dev/console 2>/dev/null
         sleep 2
         poweroff -f
     fi
 fi
+trace "guest machine started (pid ${QEMU_PID}, ${GUEST_MB} MB)"
 
 # Devices that were already present at boot fired their udev "add" events
 # before QEMU existed. Replay them now that the QMP socket is up, so every

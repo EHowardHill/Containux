@@ -48,7 +48,7 @@ fi
 #    (e.g. OrbStack's 'ubuntu') ship almost none of them. Anything missing
 #    is auto-installed via apt-get when it is available.
 REQUIRED_TOOLS="wget make gcc g++ patch gzip bzip2 xz perl tar cpio unzip rsync bc bison flex file find python3"
-APT_PACKAGES="build-essential wget cpio unzip rsync bc bison flex patch perl file xz-utils libssl-dev libncurses-dev python3"
+APT_PACKAGES="build-essential wget cpio unzip rsync bc bison flex patch perl file xz-utils libssl-dev libncurses-dev libelf-dev python3"
 
 MISSING=""
 for tool in ${REQUIRED_TOOLS}; do

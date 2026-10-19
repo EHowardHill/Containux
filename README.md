@@ -17,6 +17,28 @@ By booting silently from an `initramfs` and immediately launching a highly optim
 * **Maximized Resources:** The entire host OS runs from an `initramfs` locked to exactly 256 MB of RAM. The rest of your system's physical memory is pre-allocated directly to the guest.
 * **Deterministic Hardware UUIDs:** Prevents Windows Activation from breaking by generating and locking the guest's virtual MAC address and SMBIOS UUID to your physical motherboard.
 
+## 🧪 Testing
+
+Two scripts in `tests/` exercise the appliance inside QEMU without real hardware:
+
+```bash
+tests/make-test-disk.sh                        # creates containux-test.img (20G sparse,
+                                                # 100MB FAT32 boot partition + raw guest partition)
+tests/run-test.sh --iso /path/to/winxp.iso      # boots the real appliance against it,
+                                                # with your ISO as the physical CD-ROM
+```
+
+The disk is attached as an emulated **NVMe drive**, so the appliance's hardcoded
+`/dev/nvme0n1p1`/`p2` paths work exactly as on real hardware, and the ISO shows
+up as `/dev/sr0`. A display multiplexer (`tests/vncmux.py`, started automatically
+by `run-test.sh`) serves a **single VNC endpoint** that simulates the appliance's
+physical monitor: it shows the first-boot TUI, then hands the same window over to
+the Windows display the moment the guest machine starts — the viewer window
+resizes itself in place (RFB DesktopSize pseudo-encoding), like a monitor being
+taken over by the installed OS. Use `--mode direct` to install Windows into the
+same image as a plain, non-nested VM first; it then boots through the full
+appliance.
+
 ## 🏗️ Architecture
 
 Containux is designed around a strict two-partition layout:
@@ -76,6 +98,9 @@ containux-project/
             └── usr/local/bin/
                 ├── containux-tui.sh   # The dialog-based First-Boot interface
                 └── usb-hotplug.sh     # Script that sends JSON payloads via socat to QEMU
+└── tests/
+    ├── make-test-disk.sh            # Builds the 2-partition test disk image (20G sparse)
+    └── run-test.sh                  # Boots the appliance (+ your XP ISO) in QEMU
 ```
 
 ---

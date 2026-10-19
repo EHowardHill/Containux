@@ -14,6 +14,12 @@
 export PATH="/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin"
 export TERM="linux"
 
+# Diagnostics go to the active kernel console (serial when the test
+# harness asks for it; invisible on real hardware).
+trace() {
+    echo "Containux-TUI: $*" > /dev/console 2>/dev/null
+}
+
 BOOT_PART="/dev/nvme0n1p1"
 BOOT_MNT="/boot"
 CONF_NAME="containux.conf"
@@ -24,7 +30,8 @@ TMP=$(mktemp -d /tmp/containux-tui.XXXXXX)
 # Handshake with /init: announce ourselves, and always drop the done
 # sentinel (even on abnormal exit) so PID 1 never waits forever.
 echo $$ > /tmp/tui.pid
-trap 'rm -f /tmp/tui.pid; touch /tmp/tui.done; rm -rf "${TMP}"' EXIT
+echo "Containux: first-boot TUI started (pid $$)" > /dev/console 2>/dev/null
+trap 'rm -f /tmp/tui.pid; touch /tmp/tui.done; echo "Containux: first-boot TUI finished" > /dev/console 2>/dev/null; rm -rf "${TMP}"' EXIT
 
 # ---------------------------------------------------------------------------
 # Deterministic hardware identity (GUIDE.md §5.3)
@@ -72,6 +79,7 @@ They are locked in afterwards, so activation and drivers never break.
 
 After setup, insert your installation CD/DVD or a bootable USB stick
 and the installer will boot automatically." 13 64
+trace "welcome dialog exited rc=$?"
 
 while :; do
     if dialog --backtitle "${BACKTITLE}" --title " Target Operating System " \
@@ -80,9 +88,14 @@ while :; do
         "vista" "Windows Vista" \
         "7"     "Windows 7" 2> "${TMP}/os"; then
         [ -s "${TMP}/os" ] && break
+        trace "os menu: empty selection, retrying"
+    else
+        trace "os menu dialog failed rc=$? msg=$(head -c 200 "${TMP}/os" 2>/dev/null)"
+        sleep 1
     fi
 done
 TARGET_OS=$(cat "${TMP}/os")
+trace "selected os=${TARGET_OS}"
 
 # ---------------------------------------------------------------------------
 # 2. Graphics mode (GUIDE.md §2.2)

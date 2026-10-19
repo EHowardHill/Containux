@@ -8,7 +8,10 @@
 BR2_x86_64=y
 BR2_TOOLCHAIN_BUILDROOT_GLIBC=y
 BR2_KERNEL_HEADERS_AS_KERNEL=y
-BR2_INSTALL_LIBSTDCPP=y
+# C++ toolchain support (selected via the *visible* symbol — the plain
+# BR2_INSTALL_LIBSTDCPP is hidden and silently ignored in defconfigs).
+# Required by spice, which QXL and the audio card devices depend on.
+BR2_TOOLCHAIN_BUILDROOT_CXX=y
 
 # ---- Init: none — the custom /init (rootfs overlay) is PID 1 --------------
 # No systemd/sysvinit, no getty, no boot text: the init script takes over
@@ -17,13 +20,18 @@ BR2_INIT_NONE=y
 BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_EUDEV=y
 
 # ---- Kernel: minimal, silent, initramfs-only ------------------------------
+# NOTE: path-like options are resolved relative to the Buildroot tree root,
+# NOT this BR2_EXTERNAL tree. Use $(BR2_EXTERNAL_CONTAINUX_PATH) (the name
+# from external.desc) so paths expand to this tree wherever it is checked out.
 BR2_LINUX_KERNEL=y
 BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
-BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="board/containux/linux.config"
+BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="$(BR2_EXTERNAL_CONTAINUX_PATH)/board/containux/linux.config"
+# objtool (stack validation/ORC, required on x86_64) builds against host libelf
+BR2_LINUX_KERNEL_NEEDS_HOST_LIBELF=y
 
 # ---- BusyBox: minimal applet set ------------------------------------------
 BR2_PACKAGE_BUSYBOX=y
-BR2_PACKAGE_BUSYBOX_CONFIG="board/containux/busybox.config"
+BR2_PACKAGE_BUSYBOX_CONFIG="$(BR2_EXTERNAL_CONTAINUX_PATH)/board/containux/busybox.config"
 # Allow util-linux blkid alongside busybox's applet
 BR2_PACKAGE_BUSYBOX_SHOW_OTHERS=y
 
@@ -48,9 +56,8 @@ BR2_PACKAGE_EUDEV=y
 BR2_PACKAGE_SOCAT=y
 # dialog: the first-boot Text User Interface (GUIDE.md §2)
 BR2_PACKAGE_DIALOG=y
-# blkid: guest-partition state detection (Installed vs Empty)
-BR2_PACKAGE_UTIL_LINUX=y
-BR2_PACKAGE_UTIL_LINUX_BLKID=y
+# blkid (busybox applet) handles guest-partition state detection — see
+# board/containux/rootfs-overlay/init for the output-based check
 # iproute2: the real `ip` tool (busybox cannot create macvtap bridges)
 BR2_PACKAGE_IPROUTE2=y
 
@@ -61,5 +68,5 @@ BR2_TARGET_ROOTFS_CPIO_GZIP=y
 BR2_TARGET_ROOTFS_INITRAMFS=y
 
 # ---- Board integration -------------------------------------------------------
-BR2_ROOTFS_OVERLAY="board/containux/rootfs-overlay"
-BR2_ROOTFS_POST_BUILD_SCRIPT="board/containux/post-build.sh"
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_CONTAINUX_PATH)/board/containux/rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_CONTAINUX_PATH)/board/containux/post-build.sh"
