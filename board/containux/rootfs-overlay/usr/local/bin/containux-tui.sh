@@ -20,10 +20,42 @@ trace() {
     echo "Containux-TUI: $*" > /dev/console 2>/dev/null
 }
 
-BOOT_PART="/dev/nvme0n1p1"
 BOOT_MNT="/boot"
 CONF_NAME="containux.conf"
 BACKTITLE="Containux"
+
+# The boot partition, as detected by /init — it always runs first and
+# exports the result in /tmp/containux-parts (the layout is identified
+# by GPT type + content, because macOS inserts extra ESP/Apple_Boot
+# slices that shift the numbers). The fallback guess below only serves
+# standalone TUI testing.
+BOOT_PART=""
+if [ -f /tmp/containux-parts ]; then
+    # shellcheck disable=SC1090   # our own generated KEY=VALUE file
+    . /tmp/containux-parts
+fi
+if [ -z "${BOOT_PART}" ]; then
+    DISK_NODE=""
+    for d in /sys/block/*; do
+        b="${d##*/}"
+        case "${b}" in
+            loop*|ram*|zram*|dm-*|md*|sr*|fd*) continue ;;
+        esac
+        [ -e "${d}/device" ] || continue
+        case "$(readlink -f "${d}/device" 2>/dev/null)" in
+            */usb*) continue ;;
+        esac
+        DISK_NODE="${b}"
+        break
+    done
+    if [ -n "${DISK_NODE}" ]; then
+        P=""
+        case "${DISK_NODE}" in
+            *[0-9]) P="p" ;;
+        esac
+        BOOT_PART="/dev/${DISK_NODE}${P}1"
+    fi
+fi
 
 TMP=$(mktemp -d /tmp/containux-tui.XXXXXX)
 
@@ -152,6 +184,8 @@ GRAPHICS=\"${GRAPHICS}\"
 AUDIO=\"${AUDIO}\"
 MAC=\"${GUEST_MAC}\"
 UUID=\"${GUEST_UUID}\"
+GPU_BDF=\"${GPU_BDF}\"
+VERBOSE=\"${VERBOSE}\"
 "
 
 PERSISTED=0

@@ -12,6 +12,7 @@ By booting silently from an `initramfs` and immediately launching a highly optim
 
 * **Absolute Invisibility:** No boot text, no host logos, no window managers. Containux boots silently into the guest OS.
 * **Native Power States:** When the guest OS restarts, the virtual machine restarts. When the guest OS shuts down, the physical host machine completely powers off.
+* **Real Audio Path:** The guest's AC97/HDA card plays through the appliance's physical sound output via ALSA — no sound server, no remote protocol in the loop.
 * **Blind USB Passthrough:** Plug and play works exactly as expected. Physical USB devices (mice, keyboards, webcams, flash drives) are dynamically mapped to the guest's emulated EHCI controller the second they are plugged into the physical machine.
 * **Raw Storage Access:** Guest storage is mapped directly to a raw physical partition via QEMU's legacy IDE emulation, granting near-native NVMe/SATA speeds without requiring legacy OS drivers for modern PCIe controllers.
 * **Maximized Resources:** The entire host OS runs from an `initramfs` locked to exactly 256 MB of RAM. The rest of your system's physical memory is pre-allocated directly to the guest.
@@ -30,14 +31,21 @@ tests/run-test.sh --iso /path/to/winxp.iso      # boots the real appliance again
 
 The disk is attached as an emulated **NVMe drive**, so the appliance's hardcoded
 `/dev/nvme0n1p1`/`p2` paths work exactly as on real hardware, and the ISO shows
-up as `/dev/sr0`. A display multiplexer (`tests/vncmux.py`, started automatically
-by `run-test.sh`) serves a **single VNC endpoint** that simulates the appliance's
-physical monitor: it shows the first-boot TUI, then hands the same window over to
-the Windows display the moment the guest machine starts — the viewer window
-resizes itself in place (RFB DesktopSize pseudo-encoding), like a monitor being
-taken over by the installed OS. Use `--mode direct` to install Windows into the
-same image as a plain, non-nested VM first; it then boots through the full
-appliance.
+up as `/dev/sr0`. Everything renders in **QEMU's own native window** (cocoa on
+macOS, SDL on Linux) — no VNC anywhere in the test path:
+
+* `--mode direct` (recommended first): plain QEMU VM with the appliance's guest
+  hardware (IDE drive, e1000, AC97). The window shows Windows directly and its
+  audio plays through the host's speakers — install Windows into the image here.
+* `--mode appliance` (default): boots the real appliance. The window is the
+  appliance's "physical monitor" — the first-boot TUI, then a silent screen
+  once the nested guest runs. The appliance's sound card is emulated by the
+  host QEMU and routed to the host's audio output, so the nested Windows'
+  audio is testable end-to-end (its inner QEMU plays through the card via
+  ALSA — GUIDE.md §3.4). The appliance's own headless qxl display
+  (GUIDE.md §2.2) stays reachable at `127.0.0.1:5943` for the rare case you
+  need to see the nested Windows screen. The same image then boots through
+  the full appliance.
 
 ## 🏗️ Architecture
 
@@ -83,24 +91,32 @@ containux-project/
 ├── external.mk                     # (Empty file) Required by Buildroot external tree
 ├── configs/
 │   └── containux_defconfig         # Master Buildroot configuration file
-└── board/
-    └── containux/
-        ├── linux.config            # Minimal host kernel configuration
-        ├── busybox.config          # Minimal busybox configuration
-        ├── post-build.sh           # Script to run before packaging (sets file permissions)
-        └── rootfs-overlay/         # Files copied directly into the host OS root filesystem
-            ├── init                # The master custom boot script (Replaces systemd/sysvinit)
-            ├── etc/
-            │   ├── modprobe.d/
-            │   │   └── containux.conf       # Blacklists host USB drivers (usbhid, uvcvideo)
-            │   └── udev/rules.d/
-            │       └── 99-containux-usb.rules # Udev rules mapping USB to QEMU QMP
-            └── usr/local/bin/
-                ├── containux-tui.sh   # The dialog-based First-Boot interface
-                └── usb-hotplug.sh     # Script that sends JSON payloads via socat to QEMU
+├── package/
+│   └── qemu/                        # Buildroot package override (same package name)
+│       ├── qemu.mk                 # QEMU built WITH the ALSA audio backend
+│       └── qemu.hash               # Buildroot's hash file (copied verbatim)
+├── board/
+│   └── containux/
+│       ├── linux.config            # Minimal host kernel configuration
+│       ├── busybox.config          # Minimal busybox configuration
+│       ├── post-build.sh           # Script to run before packaging (sets file permissions)
+│       └── rootfs-overlay/         # Files copied directly into the host OS root filesystem
+│           ├── init                # The master custom boot script (Replaces systemd/sysvinit)
+│           ├── etc/
+│           │   ├── modprobe.d/
+│           │   │   └── containux.conf       # Blacklists host USB drivers (usbhid, uvcvideo)
+│           │   └── udev/rules.d/
+│           │       └── 99-containux-usb.rules # Udev rules mapping USB to QEMU QMP
+│           └── usr/local/bin/
+│               ├── containux-tui.sh   # The dialog-based First-Boot interface
+│               └── usb-hotplug.sh     # Script that sends JSON payloads via socat to QEMU
+├── installer/
+│   ├── mac-setup-disk.sh           # Formats a physical disk with the appliance layout
+│   ├── mac-install-windows.sh      # Installs Windows XP into the guest partition (native window)
+│   └── mac-verify.sh               # Boots the full appliance chain on a physical disk (native window)
 └── tests/
     ├── make-test-disk.sh            # Builds the 2-partition test disk image (20G sparse)
-    └── run-test.sh                  # Boots the appliance (+ your XP ISO) in QEMU
+    └── run-test.sh                  # Boots the appliance (+ your XP ISO) in QEMU (native window)
 ```
 
 ---

@@ -9,15 +9,19 @@ set -euo pipefail
 # Your Windows XP installation ISO is passed through to the appliance as
 # /dev/sr0, exactly like a physical CD-ROM would be (GUIDE.md §3.1).
 #
-# Two VNC endpoints are exposed so everything is observable:
-#   :$BASE     the appliance's own console (silent boot + first-boot TUI)
-#   :$(BASE+1) the Windows XP display (inner guest's VNC, forwarded through
-#              the containux.debugnet address baked into the kernel cmdline)
-#
-# Alternatively --mode direct boots the same disk + ISO as a plain,
-# non-nested QEMU VM using the exact guest hardware the appliance provides
-# (IDE drive, e1000, AC97, S3 disabled) — handy for a fast first install
-# before exercising the full appliance flow.
+# Everything renders in QEMU's own native window on the test host — no
+# VNC anywhere in the test path:
+#   appliance mode  the window is the appliance's physical monitor: the
+#                   first-boot TUI, then a silent screen once the nested
+#                   guest takes over. The appliance's sound card is
+#                   emulated by this QEMU and routed to the host's audio
+#                   output, so the nested Windows' audio is testable
+#                   (its inner QEMU plays through the card via ALSA).
+#   --mode direct  plain QEMU VM with the appliance's guest hardware
+#                   (IDE drive, e1000, AC97): the window shows Windows
+#                   directly, and its audio plays through the host.
+#                   Handy for a fast first install before exercising the
+#                   full appliance flow.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "${SCRIPT_DIR}")"
@@ -28,12 +32,13 @@ DISK="${SCRIPT_DIR}/containux-test.img"
 BZIMAGE=""
 MEMORY="2G"
 SMP="2"
-VNC_BASE="5901"
+GUEST_VNC_PORT="5943"
 DEBUGNET="10.0.2.16/24"
-NATIVE_DISPLAY=0
 SERIAL=""
 EXTRA_APPEND=""
 USE_KVM=0
+HEADLESS=0
+AUDIO=""
 
 usage() {
     cat <<EOF
@@ -51,10 +56,17 @@ Usage: $(basename "$0") --iso /path/to/windows-xp.iso [options]
   --memory SIZE       VM memory, default 2G (appliance keeps 256M for
                       itself and hands the rest to Windows)
   --smp N             virtual CPUs, default 2
-  --vnc-port N        display port, default 5901 (the single window)
+  --audio BACKEND     host audio backend for the emulated sound card,
+                      default: coreaudio on macOS, pa on Linux
+                      ("--audio none" keeps the card visible to the
+                      guest but silent)
+  --headless          run without QEMU's window (CI/remote boxes)
+  --guest-vnc-port N  localhost port forwarded to the appliance's own
+                      headless qxl display, default ${GUEST_VNC_PORT}
+                      (connect a VNC viewer only when you need to see
+                      the nested Windows display; see GUIDE.md §2.2)
   --debugnet IP/PFX   debug address for the appliance host, default
                       ${DEBUGNET} (slirp subnet)
-  --native-display    open a QEMU window instead of the outer VNC
   --serial FILE       also log the appliance kernel console to FILE
   --append STR        extra kernel cmdline parameters
   --kvm               allow KVM inside the appliance (only meaningful on
@@ -71,20 +83,21 @@ EOF
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --iso)       ISO="$2"; shift 2 ;;
-        --disk)      DISK="$2"; shift 2 ;;
-        --mode)      MODE="$2"; shift 2 ;;
-        --bzImage)   BZIMAGE="$2"; shift 2 ;;
-        --memory)    MEMORY="$2"; shift 2 ;;
-        --smp)       SMP="$2"; shift 2 ;;
-        --vnc-port)  VNC_BASE="$2"; shift 2 ;;
-        --debugnet)  DEBUGNET="$2"; shift 2 ;;
-        --native-display) NATIVE_DISPLAY=1; shift ;;
-        --serial)    SERIAL="$2"; shift 2 ;;
-        --append)    EXTRA_APPEND="$2"; shift 2 ;;
-        --kvm)       USE_KVM=1; shift ;;
-        -h|--help)   usage; exit 0 ;;
-        *)           ISO="$1"; shift ;;   # bare argument = ISO path
+        --iso)             ISO="$2"; shift 2 ;;
+        --disk)           DISK="$2"; shift 2 ;;
+        --mode)           MODE="$2"; shift 2 ;;
+        --bzImage)        BZIMAGE="$2"; shift 2 ;;
+        --memory)         MEMORY="$2"; shift 2 ;;
+        --smp)            SMP="$2"; shift 2 ;;
+        --audio)          AUDIO="$2"; shift 2 ;;
+        --headless)       HEADLESS=1; shift ;;
+        --guest-vnc-port) GUEST_VNC_PORT="$2"; shift 2 ;;
+        --debugnet)       DEBUGNET="$2"; shift 2 ;;
+        --serial)         SERIAL="$2"; shift 2 ;;
+        --append)         EXTRA_APPEND="$2"; shift 2 ;;
+        --kvm)            USE_KVM=1; shift ;;
+        -h|--help)        usage; exit 0 ;;
+        *)                ISO="$1"; shift ;;   # bare argument = ISO path
     esac
 done
 
@@ -108,13 +121,32 @@ if [ -n "${ISO}" ] && [ ! -f "${ISO}" ]; then
     exit 1
 fi
 
+if [ "${MODE}" != "appliance" ] && [ "${MODE}" != "direct" ]; then
+    echo "[!] ERROR: unknown mode '${MODE}' (expected appliance or direct)."
+    exit 1
+fi
+
 DEBUGNET_IP="${DEBUGNET%%/*}"
-# Display plumbing: the mux on VNC_BASE is the single user-facing window
-# ("physical monitor"); the raw console and guest-forward endpoints stay
-# on private localhost ports.
-CONSOLE_VNC_PORT=$((VNC_BASE + 2))
-GUEST_FWD_PORT=$((VNC_BASE + 3))
-LOCAL_IPS="$(hostname -I 2>/dev/null || true)"
+
+# --- display & audio ------------------------------------------------------------
+# Display: QEMU's own window — cocoa on macOS, SDL/GTK on Linux; --headless
+# drops the window entirely (the serial log stays available). The emulated
+# sound card is routed to the host's audio backend the same way: coreaudio
+# on macOS, PulseAudio on a Linux desktop. Audio stays emulated (visible to
+# the guest) but silent with --audio none.
+DISPLAY_ARGS=(-display cocoa)
+if [ "$(uname -s)" != "Darwin" ]; then
+    DISPLAY_ARGS=(-display default)
+fi
+if [ "${HEADLESS}" = 1 ]; then
+    DISPLAY_ARGS=(-display none)
+fi
+
+if [ -z "${AUDIO}" ]; then
+    AUDIO="coreaudio"
+    [ "$(uname -s)" = "Linux" ] && AUDIO="pa"
+fi
+AUDIO_ARGS=(-audiodev "${AUDIO},id=hostaudio" -device "AC97,audiodev=hostaudio")
 
 ARGS=()
 
@@ -161,9 +193,12 @@ if [ "${MODE}" = "appliance" ]; then
         -drive "file=${DISK},format=raw,if=none,id=nvme0"
         -device "nvme,drive=nvme0,serial=containux"
         # The installer ISO is the physical CD-ROM: /dev/sr0 in the appliance.
-        # slirp also answers the guest's DHCP, and privately forwards the
-        # inner Windows display to the display mux.
-        -nic "user,hostfwd=tcp:127.0.0.1:${GUEST_FWD_PORT}-${DEBUGNET_IP}:5900"
+        -nic "user,hostfwd=tcp:127.0.0.1:${GUEST_VNC_PORT}-${DEBUGNET_IP}:5900"
+        # The appliance's "physical" sound card: its inner QEMU's ALSA
+        # backend plays the nested Windows' audio through it (GUIDE.md
+        # §3.4), and this QEMU routes the card to the host's speakers.
+        "${AUDIO_ARGS[@]}"
+        "${DISPLAY_ARGS[@]}"
     )
     if [ -n "${ISO}" ]; then
         ARGS+=(-drive "file=${ISO},media=cdrom,format=raw")
@@ -177,31 +212,36 @@ if [ "${MODE}" = "appliance" ]; then
     echo "   disk:     ${DISK}"
     echo "   kernel:  ${BZIMAGE}"
     echo "   iso:     ${ISO:-<none>}"
+    echo "   audio:    ${AUDIO} (the appliance's sound card)"
     echo ""
-    echo " Display (the appliance's 'physical monitor'):"
-    echo "   vnc://<host>:${VNC_BASE}"
-    [ -n "${LOCAL_IPS}" ] && echo "   e.g. vnc://$(echo ${LOCAL_IPS} | cut -d' ' -f1):${VNC_BASE}"
+    echo " Display: QEMU's own window — the appliance's 'physical monitor':"
+    echo "   the first-boot TUI now, a silent screen once the guest runs."
+    echo "   The TUI is keyboard-driven: arrows + Enter (dialog ignores"
+    echo "   mouse clicks)."
     echo ""
-    echo " One window, like real hardware: it shows the first-boot TUI,"
-    echo " then the Windows display takes over the same window when the"
-    echo " guest machine starts (the window resizes itself). The TUI is"
-    echo " keyboard-driven: arrows + Enter — dialog ignores mouse clicks."
+    echo " The nested Windows' audio plays through this host's speakers."
+    echo " Its display stays inside the appliance (headless qxl); to peek,"
+    echo " connect a VNC viewer to 127.0.0.1:${GUEST_VNC_PORT} if ever needed."
     echo ""
     echo " Ctrl+C quits. The appliance powers the VM off when Windows does."
     echo "==================================================================="
 else
     ARGS+=(
-        # Mirror the appliance's inner hardware exactly (GUIDE.md §3).
+        # Mirror the appliance's inner hardware exactly (GUIDE.md §3):
+        # the EHCI controller creates the USB bus the tablet rides on.
         -machine pc
         -m "${MEMORY}"
         -smp "${SMP}"
         -drive "file=${DISK},format=raw,if=ide"
+        -device usb-ehci,id=ehci
         -device usb-tablet
         -netdev user,id=hostnet0
         -device e1000,netdev=hostnet0
-        -device AC97
+        # The guest's own sound card, routed to this host's audio output.
+        "${AUDIO_ARGS[@]}"
         -global PIIX4_PM.disable_s3=1
         -boot order=dc
+        "${DISPLAY_ARGS[@]}"
     )
     if [ -n "${ISO}" ]; then
         ARGS+=(-drive "file=${ISO},media=cdrom,if=ide")
@@ -209,46 +249,22 @@ else
 
     echo "==================================================================="
     echo " Containux direct guest test (no appliance nesting)"
-    echo "   disk: ${DISK}"
-    echo "   iso:  ${ISO:-<none>}"
+    echo "   disk:  ${DISK}"
+    echo "   iso:   ${ISO:-<none>}"
+    echo "   audio: ${AUDIO} (the guest's AC97)"
     echo ""
-    echo " Windows display: vnc://<host>:${VNC_BASE}"
-    [ -n "${LOCAL_IPS}" ] && echo "                  e.g. vnc://$(echo ${LOCAL_IPS} | cut -d' ' -f1):${VNC_BASE}"
+    echo " Display: QEMU's own window — Windows directly, audio through"
+    echo " this host's speakers."
     echo ""
     echo " Install Windows into partition 2 (the big one). The very same"
     echo " image then boots through the appliance with --mode appliance."
     echo "==================================================================="
 fi
 
-# --- display -------------------------------------------------------------------
-# Single-window experience: the mux on VNC_BASE simulates the appliance's
-# physical monitor — it shows the TUI during first boot and hands over to
-# the Windows display automatically (the viewer window resizes in place).
-MUX_PID=""
-if [ "${MODE}" = "appliance" ]; then
-    if [ "${NATIVE_DISPLAY}" = 1 ]; then
-        ARGS+=(-display default)
-    else
-        ARGS+=(-display none -vnc "127.0.0.1:$((CONSOLE_VNC_PORT - 5900))")
-        python3 "${SCRIPT_DIR}/vncmux.py" "${VNC_BASE}" \
-            127.0.0.1 "${CONSOLE_VNC_PORT}" 127.0.0.1 "${GUEST_FWD_PORT}" &
-        MUX_PID=$!
-    fi
-else
-    ARGS+=(-display none -vnc ":$((VNC_BASE - 5900))")
-fi
-
 if [ -n "${SERIAL}" ]; then
     ARGS+=(-serial "file:${SERIAL}")
 fi
 
-# Run QEMU in the foreground so the display mux (a background child) can be
-# cleaned up on exit — including Ctrl+C, where the whole process group gets
-# the signal and QEMU terminates first.
+# QEMU runs in the foreground: its window is the test's display, and Ctrl+C
+# (or closing the window) terminates it directly — no helpers to clean up.
 "${QEMU}" "${ARGS[@]}"
-QEMU_RC=$?
-if [ -n "${MUX_PID}" ]; then
-    kill "${MUX_PID}" 2>/dev/null
-    wait "${MUX_PID}" 2>/dev/null
-fi
-exit ${QEMU_RC}

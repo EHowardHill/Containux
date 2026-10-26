@@ -81,6 +81,19 @@ To expose the guest to the modern network exactly as a physical machine would be
 * **Sleep/Suspend Prevention:** Because ACPI S3 suspend behavior is unstable when passing raw devices, we must forcefully strip S3 capabilities from the virtual motherboard.
 QEMU parameter: `-global PIIX4_PM.disable_s3=1` (Guest OS will gray out "Sleep" and only offer Hibernate/Shutdown).
 
+### 3.4 Audio Output
+
+The guest's emulated sound card (§2.2) must reach the appliance's *own physical* audio output — never a sound server, and never a remote stream. The init script therefore launches the guest QEMU with an explicit ALSA backend:
+
+`-audiodev alsa,id=snd0 -device <AC97|intel-hda + hda-duplex>,audiodev=snd0`
+
+* The appliance kernel drives the physical sound card directly: both AC97 (Intel 8x0) and Intel HDA drivers are built in, covering XP-era hardware, every modern board, and the card the test harness emulates.
+* The `audiodev=` property goes on the card device — for HDA that is the *codec* (`hda-duplex`), never the bus controller (`intel-hda`).
+* Buildroot's stock QEMU recipe compiles *no* audio backend; the BR2_EXTERNAL tree overrides `package/qemu/qemu.mk` to build QEMU with `--audio-drv-list=alsa` against `alsa-lib`.
+* If the audio path is unusable (QEMU without ALSA, or no driven sound device), the init script retries with `-audiodev none`: the guest card stays visible to Windows but silent. A machine must always boot, sound or no sound — exactly like real hardware with broken speakers.
+
+**Test harness note:** `tests/run-test.sh` and `installer/mac-verify.sh` emulate the appliance's sound card on the outer QEMU and route it to the host's audio backend (CoreAudio on macOS, PulseAudio on Linux), so nested guest audio is testable end-to-end without physical hardware.
+
 ---
 
 ## 4. Dynamic USB Passthrough Architecture (The "Blind" Strategy)

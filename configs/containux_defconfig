@@ -60,6 +60,10 @@ BR2_PACKAGE_DIALOG=y
 # board/containux/rootfs-overlay/init for the output-based check
 # iproute2: the real `ip` tool (busybox cannot create macvtap bridges)
 BR2_PACKAGE_IPROUTE2=y
+# alsa-lib: the guest QEMU's ALSA backend plays the guest's audio through
+# the appliance's own sound card (GUIDE.md §3.4) — no sound server exists
+# in the appliance, so the card-level ALSA interface is the only path out.
+BR2_PACKAGE_ALSA_LIB=y
 
 # ---- Root filesystem: initramfs only ---------------------------------------
 BR2_TARGET_ROOTFS_CPIO=y

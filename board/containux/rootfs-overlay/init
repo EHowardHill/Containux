@@ -16,8 +16,10 @@
 export PATH="/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin"
 export TERM="linux"
 
-BOOT_PART="/dev/nvme0n1p1"       # 100MB FAT32: kernel, initramfs, containux.conf
-GUEST_PART="/dev/nvme0n1p2"      # raw partition handed to the guest
+BOOT_PART=""                     # 100MB FAT32: kernel, initramfs, containux.conf
+                                 # (detected in Stage 2: nvme0n1p1, sda1, ...)
+GUEST_PART=""                    # raw partition handed to the guest (p2 of the
+                                 # same disk; blank until detect_parts runs)
 BOOT_MNT="/boot"
 QMP_SOCK="/tmp/qmp.sock"
 HOST_RESERVE_MB=256              # strict host cap: kernel + udev + QEMU overhead
@@ -30,8 +32,33 @@ HOST_RESERVE_MB=256              # strict host cap: kernel + udev + QEMU overhea
 # is tty3 (out of sight, matching the invisible-boot requirement); when a
 # serial console is added to the kernel command line — as tests/run-test.sh
 # does with --serial — the markers turn into a full boot trace.
+# Progress markers go to the active kernel console. On real hardware that
+# is tty3 (out of sight, matching the invisible-boot requirement); when a
+# serial console is added to the kernel command line — as tests/run-test.sh
+# does with --serial — the markers turn into a full boot trace.
 trace() {
     echo "Containux: $*" > /dev/console 2>/dev/null
+    # VERBOSE=yes (containux.conf) mirrors every trace onto the physical
+    # display: the machine diagnoses itself on its own monitor. The
+    # one-time screen clear takes over whatever the firmware left.
+    if [ "${VERBOSE}" = "yes" ] && [ -c /dev/tty0 ]; then
+        if [ -z "${SCREEN_CLEARED}" ]; then
+            printf '\033[H\033[2J\033[3J' > /dev/tty0 2>/dev/null
+            echo "" > /dev/tty0 2>/dev/null
+            echo " Containux diagnostics (VERBOSE=yes in containux.conf)" > /dev/tty0 2>/dev/null
+            echo "" > /dev/tty0 2>/dev/null
+            SCREEN_CLEARED=1
+        fi
+        echo "Containux: $*" > /dev/tty0 2>/dev/null
+    fi
+}
+
+# Fatal errors additionally land on the physical display (regardless of
+# VERBOSE) — a machine that powers itself off should say why.
+fatal() {
+    echo "Containux: $*" > /dev/console 2>/dev/null
+    echo "" > /dev/tty0 2>/dev/null
+    echo "Containux: $*" > /dev/tty0 2>/dev/null
 }
 
 # Probe whether KVM can be used. On real hardware this is trivial (CPU
@@ -63,12 +90,13 @@ input_ev() {
     ' /proc/bus/input/devices 2>/dev/null | grep -o 'event[0-9]*' | head -n 1
 }
 
-# Record the sysfs busnum/devnum of the USB stick behind /dev/sda so the
+# Record the sysfs busnum/devnum of the detected USB install stick so the
 # udev→QMP pipeline can skip it (it is mapped as a guest block device).
 record_install_stick() {
-    SDIR=$(readlink -f /sys/block/sda 2>/dev/null)
+    [ -n "${USB_STICK_NODE}" ] || return 1
+    SDIR=$(readlink -f "/sys/block/${USB_STICK_NODE}" 2>/dev/null)
     [ -n "${SDIR}" ] || return 1
-    UDEV_DIR=$(dirname "${SDIR%/block/sda}")
+    UDEV_DIR=$(dirname "${SDIR%/block/${USB_STICK_NODE}}")
     [ -f "${UDEV_DIR}/busnum" ] || return 1
     echo "$(cat "${UDEV_DIR}/busnum") $(cat "${UDEV_DIR}/devnum")" \
         > /tmp/containux-install-stick
@@ -80,12 +108,162 @@ cdrom_has_media() {
     dd if=/dev/sr0 bs=1 count=1 >/dev/null 2>&1
 }
 
-# /dev/sda present and physically on the USB bus?
+# First USB-backed SCSI disk (the installation stick) or none; the node
+# name is printed on stdout. Only USB-attached media counts, so the
+# internal disk is never mistaken for install media no matter which
+# controller it sits on (nvme0n1, sda, sdb, ...). The appliance's own
+# disk is excluded too — when the appliance itself boots from a USB
+# stick, it must not hand itself over as installation media.
+find_usb_stick() {
+    for d in /sys/block/sd*; do
+        [ -e "${d}/device" ] || continue
+        [ "${d##*/}" = "${DISK_NODE}" ] && continue
+        case "$(readlink -f "${d}/device" 2>/dev/null)" in
+            */usb*) echo "${d##*/}"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# USB install media present? Leaves the node name in USB_STICK_NODE.
 usb_stick_present() {
-    [ -b /dev/sda ] || return 1
-    case "$(readlink -f /sys/block/sda 2>/dev/null)" in
-        */usb*) return 0 ;;
+    USB_STICK_NODE=$(find_usb_stick)
+    [ -n "${USB_STICK_NODE}" ]
+}
+
+# GPT type GUID of a partition node, via eudev's blkid builtin (the
+# properties it imports get the ID_ prefix). Empty when the table is
+# MBR or the udev database has no entry yet.
+part_type() {
+    udevadm info -q property -n "/dev/$1" 2>/dev/null |
+        sed -n 's/^ID_PART_ENTRY_TYPE=//p' | tr '[:upper:]' '[:lower:]'
+}
+
+# Does one whole-disk node carry the appliance layout (GUIDE.md §1)?
+# The layout is fixed in *content* — an ESP carrying the kernel/state
+# file plus a Linux-typed raw guest partition — never in slice numbers:
+# macOS silently inserts its own ESP and Apple_Boot slices when it
+# partitions a physical disk, which shifts every later slice by one.
+# NVMe namespaces spell partitions nvme0n1p1..., SATA/USB disks sda1...
+# A Windows install stick never matches: its table has no Linux-typed
+# partition. Sets BOOT_PART/GUEST_PART/DISK_QUALITY on success
+# (quality 2: ESP carries the appliance; 1: loose two-slice fallback).
+classify_disk() {
+    DISK="$1"
+    P=""
+    case "${DISK}" in
+        *[0-9]) P="p" ;;                    # nvme0n1 -> nvme0n1p1, mmcblk0 -> mmcblk0p1
     esac
+
+    # Classify every partition by its GPT type GUID (GUIDE.md §1):
+    # boot = EFI System Partition, guest = Linux filesystem.
+    BOOT_CANDS=""
+    GUEST_PART=""
+    PART_COUNT=0
+    for pdir in /sys/block/${DISK}/${DISK}${P}[0-9]*; do
+        [ -d "${pdir}" ] || continue
+        [ -n "$(cat "${pdir}/partition" 2>/dev/null)" ] || continue
+        PART_COUNT=$((PART_COUNT + 1))
+        pnode="/dev/${pdir##*/}"
+        case "$(part_type "${pdir##*/}")" in
+            c12a7328-f81f-11d2-ba4b-00a0c93ec93b)
+                BOOT_CANDS="${BOOT_CANDS} ${pnode}"
+                ;;
+            0fc63daf-8483-4772-8e79-3d69d210f577)
+                GUEST_PART="${pnode}"
+                ;;
+        esac
+    done
+
+    # Classic two-slice layouts (MBR test images, hand-built disks) carry
+    # no GUIDs: fall back to p1 + p2.
+    if [ -z "${BOOT_CANDS}" ] && [ -z "${GUEST_PART}" ] && [ "${PART_COUNT}" = 2 ]; then
+        BOOT_CANDS="/dev/${DISK}${P}1"
+        GUEST_PART="/dev/${DISK}${P}2"
+    fi
+    if [ -z "${BOOT_CANDS}" ] || [ -z "${GUEST_PART}" ]; then
+        return 1
+    fi
+
+    # Several ESP-typed partitions can coexist (macOS reserves its own);
+    # ours is the one that mounts as vfat and carries the appliance — the
+    # state file or the kernel image. Blank impostors fail to mount and
+    # drop out of the race on their own; an empty but mountable vfat
+    # (the MBR test-disk layout) is kept as a last-resort fallback.
+    BOOT_PART=""
+    BOOT_FALLBACK=""
+    mkdir -p /mnt/probe
+    for c in ${BOOT_CANDS}; do
+        mount -t vfat -o ro "${c}" /mnt/probe 2>/dev/null || continue
+        if [ -f /mnt/probe/containux.conf ] ||
+           [ -f /mnt/probe/EFI/BOOT/BOOTX64.EFI ]; then
+            BOOT_PART="${c}"
+        elif [ -z "${BOOT_FALLBACK}" ]; then
+            BOOT_FALLBACK="${c}"
+        fi
+        umount /mnt/probe 2>/dev/null
+        [ -n "${BOOT_PART}" ] && break
+    done
+    rmdir /mnt/probe 2>/dev/null
+    [ -n "${BOOT_PART}" ] || BOOT_PART="${BOOT_FALLBACK}"
+    if [ -z "${BOOT_PART}" ]; then
+        return 1
+    fi
+    if [ "${BOOT_PART}" = "${BOOT_FALLBACK}" ]; then
+        DISK_QUALITY=1
+    else
+        DISK_QUALITY=2
+    fi
+    return 0
+}
+
+# Locate the appliance's own disk and its two partitions. Internal disks
+# are scanned first — in the normal deployment USB disks are installation
+# media — and USB-attached disks second, so the appliance can also be
+# booted from (and live on) a USB stick. Within a pass, a disk that
+# verifiably carries the appliance wins over loose two-slice guesses, so
+# a random FAT stick is never mistaken for the machine.
+detect_parts() {
+    DISK_NODE=""
+    LOOSE_NODE=""
+    pass=1
+    while [ ${pass} -le 2 ]; do
+        for d in /sys/block/*; do
+            b="${d##*/}"
+            case "${b}" in
+                loop*|ram*|zram*|dm-*|md*|sr*|fd*) continue ;;
+            esac
+            [ -e "${d}/device" ] || continue    # whole disks only
+            case "$(readlink -f "${d}/device" 2>/dev/null)" in
+                */usb*)
+                    # USB bus: install media in pass 1, appliance
+                    # candidate in pass 2 (boot-from-USB deployments).
+                    if [ ${pass} = 1 ]; then
+                        continue
+                    fi
+                    ;;
+                *)
+                    if [ ${pass} = 2 ]; then
+                        continue                 # internal: pass 1 only
+                    fi
+                    ;;
+            esac
+            if classify_disk "${b}"; then
+                if [ "${DISK_QUALITY}" = 2 ]; then
+                    DISK_NODE="${b}"
+                    return 0
+                fi
+                [ -n "${LOOSE_NODE}" ] || LOOSE_NODE="${b}"
+            fi
+        done
+        pass=$((pass + 1))
+    done
+    # No verifiable appliance anywhere: accept the one loose guess, if
+    # the machine offered exactly one (the emulated test harness).
+    if [ -n "${LOOSE_NODE}" ] && classify_disk "${LOOSE_NODE}"; then
+        DISK_NODE="${LOOSE_NODE}"
+        return 0
+    fi
     return 1
 }
 
@@ -96,8 +274,13 @@ start_qemu() {
     rm -f "${QMP_SOCK}"
     # QEMU diagnostics go to the active kernel console: invisible on real
     # hardware (console=tty3), but captured by the test harness when it
-    # appends console=ttyS0.
-    qemu-system-x86_64 ${QEMU_ARGS} 2>>/dev/console &
+    # appends console=ttyS0. In VERBOSE mode they are mirrored onto the
+    # physical display instead.
+    QEMU_ERR="/dev/console"
+    if [ "${VERBOSE}" = "yes" ] && [ -c /dev/tty0 ]; then
+        QEMU_ERR="/dev/tty0"
+    fi
+    qemu-system-x86_64 ${QEMU_ARGS} 2>>"${QEMU_ERR}" &
     QEMU_PID=$!
     i=0
     while [ ${i} -lt 100 ]; do
@@ -147,6 +330,30 @@ printf '\033[H\033[2J\033[3J' > /dev/tty1 2>/dev/null
 udevd --daemon 2>/dev/null
 udevadm trigger --action=add 2>/dev/null
 udevadm settle --timeout=10 2>/dev/null
+
+# The appliance disk and its boot/guest partitions (by GPT type + content).
+if ! detect_parts; then
+    fatal "appliance disk not found (internal disk with ESP + Linux partitions)"
+    sleep 10
+    poweroff -f
+fi
+
+# Early containux.conf read: VERBOSE decides whether traces also go to the
+# physical display, so it must be known before the first trace. One short
+# read-only mount; Stage 4 loads the conf again for the normal flow.
+VERBOSE=""
+if mount -t vfat -o ro "${BOOT_PART}" "${BOOT_MNT}" 2>/dev/null; then
+    if [ -f "${BOOT_MNT}/containux.conf" ]; then
+        # shellcheck disable=SC1090   # our own generated KEY="VALUE" file
+        . "${BOOT_MNT}/containux.conf"
+    fi
+    umount "${BOOT_MNT}" 2>/dev/null
+fi
+# Export the result for the first-boot TUI, which must not repeat the
+# whole discovery dance.
+echo "BOOT_PART=${BOOT_PART}" > /tmp/containux-parts
+echo "GUEST_PART=${GUEST_PART}" >> /tmp/containux-parts
+trace "disk: node=${DISK_NODE} boot=${BOOT_PART} guest=${GUEST_PART}"
 
 # Guest RAM is locked by preallocation; the host must never OOM-kill QEMU.
 # Strict overcommit (mode 2) is required for that, but its default
@@ -336,21 +543,54 @@ trace "net: nic=${PRIMARY_NIC} tap=${TAP_NODE:-none} debugnet=${DEBUGNET:-none}"
 # Stage 7 — virtual motherboard options (GUIDE.md §2.2, §3, §5.3)
 # ---------------------------------------------------------------------------
 
-# Graphics: default qxl (headless, VNC served on all interfaces so the
-# containux.debugnet path — or a physical network — can reach it), or bind
-# the PCIe GPU to vfio-pci and pass it through raw.
+# Graphics (GUIDE.md §2.2): "qxl" renders the guest into a VNC server
+# (headless — nothing is ever scanned out to a physical monitor), while
+# "vfio" passes the physical GPU through raw so the guest's own display
+# appears on the machine's monitor. Passthrough requires the card to be
+# bound to vfio-pci AND to become the guest's primary VGA (x-vga=on),
+# or SeaBIOS never VGA-initializes it and the monitor stays black.
 VGA_ARGS="-vga qxl -vnc 0.0.0.0:0"
 if [ "${GRAPHICS}" = "vfio" ]; then
-    GPU_BDF=""
-    for d in /sys/bus/pci/devices/*; do
-        case "$(cat "${d}/class" 2>/dev/null)" in
-            0x0300*|0x0302*) GPU_BDF="${d##*/}"; break ;;
-        esac
-    done
-    if [ -n "${GPU_BDF}" ]; then
+    # Which GPU: containux.conf GPU_BDF ("01:00.0") wins. Auto-detection
+    # prefers a DISCRETE card over on-chip graphics: add-in cards sit on
+    # a bus behind a PCIe bridge (bus 01+), while the CPU's integrated
+    # GPU lives on bus 00 — and the monitor is plugged into the card.
+    if [ -z "${GPU_BDF}" ]; then
+        GPU_FALLBACK=""
+        for d in /sys/bus/pci/devices/*; do
+            case "$(cat "${d}/class" 2>/dev/null)" in
+                0x0300*|0x0302*) ;;
+                *) continue ;;
+            esac
+            bdf="${d##*/}"
+            [ -n "${GPU_FALLBACK}" ] || GPU_FALLBACK="${bdf}"
+            if [ "$(printf '%s' "${bdf}" | cut -d: -f2)" != "00" ]; then
+                GPU_BDF="${bdf}"
+                break
+            fi
+        done
+        GPU_BDF="${GPU_BDF:-${GPU_FALLBACK}}"
+    fi
+    trace "vfio: passing GPU ${GPU_BDF:-none} to vfio-pci..."
+    VFIO_OK=0
+    if [ -n "${GPU_BDF}" ] && [ -e "/sys/bus/pci/devices/${GPU_BDF}" ]; then
         echo "vfio-pci" > "/sys/bus/pci/devices/${GPU_BDF}/driver_override" 2>/dev/null
         echo "${GPU_BDF}" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null
-        VGA_ARGS="-vga none -device vfio-pci,host=${GPU_BDF}"
+        # Trust the bind only when the device really moved to vfio-pci —
+        # without an IOMMU (VT-d / AMD-Vi off in firmware) it silently
+        # fails, and a half-bound card is worse than the virtual display.
+        if [ "$(basename "$(readlink "/sys/bus/pci/devices/${GPU_BDF}/driver" 2>/dev/null)" 2>/dev/null)" = "vfio-pci" ]; then
+            VFIO_OK=1
+        fi
+    fi
+    if [ "${VFIO_OK}" = 1 ]; then
+        # From here the host's VGA console is dead (vfio owns the card);
+        # whatever is on the monitor now stays until SeaBIOS draws.
+        trace "vfio: GPU ${GPU_BDF} bound; it is now the guest's primary VGA"
+        VGA_ARGS="-vga none -device vfio-pci,host=${GPU_BDF},x-vga=on"
+    else
+        trace "vfio: GPU ${GPU_BDF:-none} not bound (IOMMU/VT-d off in firmware?); falling back to qxl"
+        VGA_ARGS="-vga qxl -vnc 0.0.0.0:0"
     fi
 fi
 # Relative-pointer tablet helps VNC cursor tracking once the guest has HID
@@ -359,11 +599,28 @@ if [ "${GRAPHICS}" = "qxl" ] && [ "${INSTALL_MODE}" = 0 ]; then
     VGA_ARGS="${VGA_ARGS} -device usb-tablet"
 fi
 
-# Audio: AC97 for XP, Intel HDA for Vista/7 (GUIDE.md §2.2).
-AUDIO_ARGS="-device AC97"
+# Audio (GUIDE.md §2.2, §3.4): AC97 for XP, Intel HDA for Vista/7 — and
+# the guest's sound is played through the appliance's OWN card: the inner
+# QEMU's ALSA backend writes into the sound device the appliance kernel
+# drove (a physical card on real hardware, the card the test harness's
+# outer QEMU emulates in the lab). audiodev= goes on the card device —
+# for HDA that is the codec (hda-duplex), never the bus controller.
+AUDIO_CARD="AC97"
+AUDIO_CODEC=""
 if [ "${AUDIO}" = "hda" ]; then
-    AUDIO_ARGS="-device intel-hda -device hda-duplex"
+    AUDIO_CARD="intel-hda"
+    AUDIO_CODEC="hda-duplex"
 fi
+audio_args() {
+    # $1 = audiodev backend: "alsa" (play through the appliance's sound
+    # card) or "none" (guest card stays visible but silent — the
+    # broken-audio fallback real hardware would present too).
+    if [ -n "${AUDIO_CODEC}" ]; then
+        AUDIO_ARGS="-audiodev $1,id=snd0 -device ${AUDIO_CARD} -device ${AUDIO_CODEC},audiodev=snd0"
+    else
+        AUDIO_ARGS="-audiodev $1,id=snd0 -device ${AUDIO_CARD},audiodev=snd0"
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Stage 8 — installation media (GUIDE.md §3.1)
@@ -454,24 +711,33 @@ if [ "${CDROM}" = 1 ]; then
     DRIVE_EXTRA_ARGS="${DRIVE_EXTRA_ARGS} -drive file=/dev/sr0,media=cdrom,if=ide"
 fi
 if [ "${INSTALL_MODE}" = 1 ] && [ "${USBMEDIA}" = 1 ]; then
-    DRIVE_EXTRA_ARGS="${DRIVE_EXTRA_ARGS} -drive file=/dev/sda,format=raw,if=none,id=usbdrive -device usb-storage,drive=usbdrive"
+    DRIVE_EXTRA_ARGS="${DRIVE_EXTRA_ARGS} -drive file=/dev/${USB_STICK_NODE},format=raw,if=none,id=usbdrive -device usb-storage,drive=usbdrive"
 fi
 
-# GUIDE.md §3.1 specifies aio=native; Buildroot's QEMU ships without
-# linux-aio, so try native first and silently fall back to threaded AIO.
-AIO_ARG="aio=native"
-build_qemu_args
-if ! start_qemu; then
-    AIO_ARG="aio=threads"
-    build_qemu_args
-    if ! start_qemu; then
-        # The machine model could not be built at all — nothing to show.
-        trace "guest machine failed to start; powering off"
-        echo "Containux: guest machine failed to start; powering off." > /dev/console 2>/dev/null
-        sleep 2
-        poweroff -f
-    fi
+# Launch attempts, most capable first. GUIDE.md §3.1 specifies aio=native;
+# Buildroot's QEMU ships without linux-aio, so native AIO falls back to
+# threads. Independently, the ALSA backend falls back to a silent guest card
+# when the audio path is unusable (QEMU built without ALSA, or no driven
+# sound device): a machine must always boot, sound or no sound.
+GUEST_STARTED=0
+for AUDIO_BACKEND in alsa none; do
+    audio_args "${AUDIO_BACKEND}"
+    for AIO_ARG in aio=native aio=threads; do
+        build_qemu_args
+        if start_qemu; then
+            GUEST_STARTED=1
+            break 2
+        fi
+    done
+done
+if [ "${GUEST_STARTED}" != 1 ]; then
+    # The machine model could not be built at all — say why on the physical
+    # display, then power down like real hardware would.
+    fatal "guest machine failed to start; powering off"
+    sleep 10
+    poweroff -f
 fi
+[ "${AUDIO_BACKEND}" = "alsa" ] || trace "audio: no usable ALSA device; guest card stays silent"
 trace "guest machine started (pid ${QEMU_PID}, ${GUEST_MB} MB)"
 
 # Devices that were already present at boot fired their udev "add" events
